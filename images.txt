@@ -7,3 +7,14 @@ xhofe/alist:latest
 postgres:16-alpine
 ghcr.io/usekaneo/kaneo:2.28.3
 makeplane/plane-proxy:stable
+rabbitmq:3.13.6-management-alpine
+makeplane/plane-backend:v1.4.3
+docker.io/pgsty/silo:RELEASE.2026-09-16T00-00-00Z
+makeplane/plane-admin:v1.4.3
+postgres:15.7-alpine
+makeplane/plane-space:v1.4.3
+makeplane/plane-live:v1.4.3
+makeplane/plane-proxy:v1.4.3
+valkey/valkey:7.2.11-alpine
+makeplane/plane-frontend:v1.4.3
+
