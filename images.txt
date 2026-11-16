@@ -1,6 +1,3 @@
-makeplane/plane-space:v1.4.3
-makeplane/plane-live:v1.4.3
-makeplane/plane-proxy:v1.4.3
-valkey/valkey:7.2.11-alpine
-makeplane/plane-frontend:v1.4.3
+makeplane/plane-backend:stable
+
 
