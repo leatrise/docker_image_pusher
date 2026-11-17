@@ -1,9 +1,4 @@
-makeplane/email-commercial:v2.6.3
-makeplane/silo-commercial:v2.6.3
-makeplane/web-commercial:v2.6.3
-makeplane/backend-commercial:v2.6.3
-makeplane/iframely:v1.2.0
-minio/minio:latest
+quay.io/minio/minio:latest
 makeplane/plane-pi-commercial:v2.6.3
 rabbitmq:3.13.6-management-alpine
 valkey/valkey:7.2.11-alpine
