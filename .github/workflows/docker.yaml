@@ -80,8 +80,16 @@ jobs:
                 temp_map[$image_name]=$name_space
             fi       
         done < images.txt
-        
-        
+
+        # Report individual image results in the GitHub Actions run summary.
+        {
+            echo "## Docker Image Push Summary"
+            echo "| Source image | Target image | Result |"
+            echo "| --- | --- | --- |"
+        } >> "$GITHUB_STEP_SUMMARY"
+        success=0
+        failed=0
+
         while IFS= read -r line || [ -n "$line" ]; do
             # 忽略空行与注释
             [[ -z "$line" ]] && continue
@@ -89,8 +97,6 @@ jobs:
                 continue
             fi
         
-            echo "docker pull $line"
-            docker pull $line
             platform=$(echo "$line" | awk -F'--platform[ =]' '{if (NF>1) print $2}' | awk '{print $1}')
             echo "platform is $platform"
             # 如果存在架构信息 将架构信息拼到镜像名称前面
@@ -122,19 +128,43 @@ jobs:
             # 将@sha256:等字符删除
             image_name_tag="${image_name_tag%%@*}"
             new_image="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/$platform_prefix$name_space_prefix$image_name_tag"
-            echo "docker tag $image $new_image"
-            docker tag $image $new_image
-            echo "docker push $new_image"
-            docker push $new_image
-            echo "开始清理磁盘空间"
-            echo "=============================================================================="
+            # A failed image should not prevent subsequent images from running.
+            if ! docker pull $line; then
+                echo "| \`$line\` | \`$new_image\` | ❌ Pull failed |" >> "$GITHUB_STEP_SUMMARY"
+                ((failed+=1))
+                continue
+            fi
+
+            if ! docker tag "$image" "$new_image"; then
+                echo "| \`$line\` | \`$new_image\` | ❌ Tag failed |" >> "$GITHUB_STEP_SUMMARY"
+                ((failed+=1))
+                docker rmi "$image" || true
+                continue
+            fi
+
+            if docker push "$new_image"; then
+                echo "| \`$line\` | \`$new_image\` | ✅ Pushed |" >> "$GITHUB_STEP_SUMMARY"
+                ((success+=1))
+            else
+                echo "| \`$line\` | \`$new_image\` | ❌ Push failed |" >> "$GITHUB_STEP_SUMMARY"
+                ((failed+=1))
+            fi
+
+            # Cleanup failures must not change the recorded push result.
+            docker rmi "$image" "$new_image" || true
             df -hT
-            echo "=============================================================================="
-            docker rmi $image
-            docker rmi $new_image
-            echo "磁盘空间清理完毕"
-            echo "=============================================================================="
-            df -hT
-            echo "=============================================================================="     
-            
+
         done < images.txt
+
+        {
+            echo ""
+            echo "### Totals"
+            echo "- ✅ Successful: $success"
+            echo "- ❌ Failed: $failed"
+            echo "- 📦 Total: $((success + failed))"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        # Keep the job red if any image failed, after processing all images.
+        if (( failed > 0 )); then
+            exit 1
+        fi
