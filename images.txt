@@ -1,4 +1,4 @@
-pgsty/silo:latest
+pgsty/minio:RELEASE.2026-08-04T00-00-00Z
 makeplane/plane-pi-commercial:v2.6.3
 rabbitmq:3.13.6-management-alpine
 valkey/valkey:7.2.11-alpine
