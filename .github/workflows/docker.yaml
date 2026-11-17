@@ -5,7 +5,6 @@ on:
   push:
     branches: [ main ]
 
-
 env:
   ALIYUN_REGISTRY: "${{ secrets.ALIYUN_REGISTRY }}"
   ALIYUN_NAME_SPACE: "${{ secrets.ALIYUN_NAME_SPACE }}"
@@ -13,158 +12,195 @@ env:
   ALIYUN_REGISTRY_PASSWORD: "${{ secrets.ALIYUN_REGISTRY_PASSWORD }}"
 
 jobs:
+  prepare:
+    name: Prepare image list
+    runs-on: ubuntu-latest
+    outputs:
+      images: ${{ steps.matrix.outputs.images }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image matrix
+        id: matrix
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import shlex
+          from collections import defaultdict
+          from pathlib import Path
 
-  build:
-    name: Pull
+          items = []
+          for raw in Path('images.txt').read_text().splitlines():
+              raw = raw.strip()
+              if not raw or raw.startswith('#'):
+                  continue
+              args = shlex.split(raw)
+              source = args[-1]
+              image = source.split('@', 1)[0]
+              parts = image.split('/')
+              basename = parts[-1]
+              namespace = parts[1] if len(parts) == 3 else (parts[0] if len(parts) == 2 else '')
+              image_name = basename.split(':', 1)[0]
+              platform = ''
+              for index, arg in enumerate(args):
+                  if arg.startswith('--platform='):
+                      platform = arg.split('=', 1)[1]
+                  elif arg == '--platform' and index + 1 < len(args):
+                      platform = args[index + 1]
+              items.append({
+                  'id': len(items), 'source': source, 'pull_args': args,
+                  'basename': basename, 'namespace': namespace,
+                  'image_name': image_name, 'platform': platform,
+              })
+
+          namespaces = defaultdict(set)
+          for item in items:
+              namespaces[item['image_name']].add(item['namespace'])
+
+          for item in items:
+              prefix = item['platform'].replace('/', '_') + '_' if item['platform'] else ''
+              if len(namespaces[item['image_name']]) > 1 and item['namespace']:
+                  prefix += item['namespace'] + '_'
+              item['target_name'] = prefix + item['basename']
+              for key in ('basename', 'namespace', 'image_name', 'platform'):
+                  del item[key]
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              print('images=' + json.dumps(items, separators=(',', ':')), file=output)
+          PY
+
+  push:
+    name: Push ${{ matrix.item.source }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        item: ${{ fromJSON(needs.prepare.outputs.images) }}
+    steps:
+      - name: Pull and push to Aliyun
+        id: transfer
+        shell: bash
+        env:
+          ITEM_JSON: ${{ toJSON(matrix.item) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          item = json.loads(os.environ['ITEM_JSON'])
+          with open('image-data.json', 'w') as f:
+              json.dump(item, f)
+          PY
+          source=$(python3 -c 'import json; print(json.load(open("image-data.json"))["source"])')
+          target_name=$(python3 -c 'import json; print(json.load(open("image-data.json"))["target_name"])')
+          target="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/$target_name"
+          status=success
+          stage=push
+
+          if ! printf '%s' "$ALIYUN_REGISTRY_PASSWORD" | docker login "$ALIYUN_REGISTRY" --username "$ALIYUN_REGISTRY_USER" --password-stdin; then
+            status=failed
+            stage=login
+          else
+            mapfile -t pull_args < <(python3 -c 'import json; print("\n".join(json.load(open("image-data.json"))["pull_args"]))')
+            if ! docker pull "${pull_args[@]}"; then
+              status=failed
+              stage=pull
+            elif ! docker tag "$source" "$target"; then
+              status=failed
+              stage=tag
+            elif ! docker push "$target"; then
+              status=failed
+              stage=push
+            fi
+          fi
+
+          export IMAGE_STATUS="$status" IMAGE_STAGE="$stage" IMAGE_TARGET="$target"
+          python3 - <<'PY'
+          import json
+          import os
+          item = json.load(open('image-data.json'))
+          result = {
+              'id': item['id'], 'source': item['source'],
+              'target': os.environ['IMAGE_TARGET'],
+              'status': os.environ['IMAGE_STATUS'],
+              'stage': os.environ['IMAGE_STAGE'],
+          }
+          with open(f"result-{item['id']}.json", 'w') as f:
+              json.dump(result, f)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              icon = '✅' if result['status'] == 'success' else '❌'
+              print(f"## {icon} {result['source']}", file=f)
+              print(f"Target: `{result['target']}`", file=f)
+              print(f"Result: **{result['status']}** (stage: {result['stage']})", file=f)
+          PY
+
+          docker rmi "$source" "$target" || true
+          [[ "$status" == success ]]
+
+      - name: Upload image result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: push-result-${{ matrix.item.id }}
+          path: result-*.json
+          if-no-files-found: warn
+          retention-days: 7
+
+  summary:
+    name: Generate summary
+    needs: [prepare, push]
+    if: always() && needs.prepare.result == 'success'
     runs-on: ubuntu-latest
     steps:
-    - name: Before freeing up disk space
-      run: |
-        echo "Before freeing up disk space"
-        echo "=============================================================================="
-        df -hT
-        echo "=============================================================================="
+      - name: Download results
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: push-result-*
+          path: results
+          merge-multiple: true
+      - name: Report all images
+        if: always()
+        shell: bash
+        env:
+          IMAGE_MATRIX: ${{ needs.prepare.outputs.images }}
+          REGISTRY: ${{ secrets.ALIYUN_REGISTRY }}
+          NAMESPACE: ${{ secrets.ALIYUN_NAME_SPACE }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          expected = json.loads(os.environ['IMAGE_MATRIX'])
+          results = {}
+          for path in Path('results').glob('*.json'):
+              result = json.loads(path.read_text())
+              results[result['id']] = result
 
-    - name: Restart docker
-      run: sudo service docker restart
+          success = 0
+          failed = 0
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
+              print('## 🐳 Docker Image Push Summary\n', file=out)
+              print('| Source | Target | Result |', file=out)
+              print('|---|---|---|', file=out)
+              for item in expected:
+                  result = results.get(item['id'])
+                  if result:
+                      ok = result['status'] == 'success'
+                      stage = result['stage']
+                      target = result['target']
+                  else:
+                      ok = False
+                      stage = 'missing result'
+                      target = f"{os.environ['REGISTRY']}/{os.environ['NAMESPACE']}/{item['target_name']}"
+                  success += int(ok)
+                  failed += int(not ok)
+                  state = '✅ Success' if ok else f'❌ Failed ({stage})'
+                  print(f"| `{item['source']}` | `{target}` | {state} |", file=out)
+              print(f'\n**Total:** {len(expected)} · **Successful:** {success} · **Failed:** {failed}', file=out)
 
-    - name: Free up disk space complete
-      run: |
-        echo "Free up disk space complete"
-        echo "=============================================================================="
-        df -hT
-        echo "=============================================================================="
-
-    - name: Checkout Code
-      uses: actions/checkout@v4
-
-    - name: Build and push image Aliyun
-      run: |
-        docker login -u $ALIYUN_REGISTRY_USER -p $ALIYUN_REGISTRY_PASSWORD $ALIYUN_REGISTRY
-        # 数据预处理,判断镜像是否重名
-        declare -A duplicate_images
-        declare -A temp_map
-        while IFS= read -r line || [ -n "$line" ]; do
-            # 忽略空行与注释
-            [[ -z "$line" ]] && continue
-            if echo "$line" | grep -q '^\s*#'; then
-                continue
-            fi
-            
-            # 获取镜像的完整名称，例如kasmweb/nginx:1.25.3（命名空间/镜像名:版本号）
-            image=$(echo "$line" | awk '{print $NF}')
-            # 将@sha256:等字符删除
-            image="${image%%@*}"
-            echo "image $image"
-            # 获取镜像名:版本号  例如nginx:1.25.3
-            image_name_tag=$(echo "$image" | awk -F'/' '{print $NF}')
-            echo "image_name_tag $image_name_tag"
-            # 获取命名空间 例如kasmweb,  这里有种特殊情况 docker.io/nginx，把docker.io当成命名空间，也OK
-            name_space=$(echo "$image" | awk -F'/' '{if (NF==3) print $2; else if (NF==2) print $1; else print ""}')
-            echo "name_space: $name_space"
-            # 这里不要是空值影响判断
-            name_space="${name_space}_"
-            # 获取镜像名例如nginx
-            image_name=$(echo "$image_name_tag" | awk -F':' '{print $1}')
-            echo "image_name: $image_name"
-            
-            # 如果镜像存在于数组中，则添加temp_map
-            if [[ -n "${temp_map[$image_name]}" ]]; then
-                 # 如果temp_map已经存在镜像名，判断是不是同一命名空间
-                 if [[ "${temp_map[$image_name]}" != $name_space  ]]; then
-                    echo "duplicate image name: $image_name"
-                    duplicate_images[$image_name]="true"
-                 fi
-            else
-                # 存镜像的命名空间
-                temp_map[$image_name]=$name_space
-            fi       
-        done < images.txt
-
-        # Report individual image results in the GitHub Actions run summary.
-        {
-            echo "## Docker Image Push Summary"
-            echo "| Source image | Target image | Result |"
-            echo "| --- | --- | --- |"
-        } >> "$GITHUB_STEP_SUMMARY"
-        success=0
-        failed=0
-
-        while IFS= read -r line || [ -n "$line" ]; do
-            # 忽略空行与注释
-            [[ -z "$line" ]] && continue
-            if echo "$line" | grep -q '^\s*#'; then
-                continue
-            fi
-        
-            platform=$(echo "$line" | awk -F'--platform[ =]' '{if (NF>1) print $2}' | awk '{print $1}')
-            echo "platform is $platform"
-            # 如果存在架构信息 将架构信息拼到镜像名称前面
-            if [ -z "$platform" ]; then
-                platform_prefix=""
-            else
-                platform_prefix="${platform//\//_}_"
-            fi
-            echo "platform_prefix is $platform_prefix"
-            # 获取镜像的完整名称，例如kasmweb/nginx:1.25.3（命名空间/镜像名:版本号）
-            image=$(echo "$line" | awk '{print $NF}')
-
-            # 获取 镜像名:版本号  例如nginx:1.25.3
-            image_name_tag=$(echo "$image" | awk -F'/' '{print $NF}')
-            # 获取命名空间 例如kasmweb  这里有种特殊情况 docker.io/nginx，把docker.io当成命名空间，也OK
-            name_space=$(echo "$image" | awk -F'/' '{if (NF==3) print $2; else if (NF==2) print $1; else print ""}')
-            # 获取镜像名例  例如nginx
-            image_name=$(echo "$image_name_tag" | awk -F':' '{print $1}')
-        
-            name_space_prefix=""
-            # 如果镜像名重名
-            if [[ -n "${duplicate_images[$image_name]}" ]]; then
-               #如果命名空间非空，将命名空间加到前缀
-               if [[ -n "${name_space}" ]]; then
-                  name_space_prefix="${name_space}_"
-               fi
-            fi
-            
-            # 将@sha256:等字符删除
-            image_name_tag="${image_name_tag%%@*}"
-            new_image="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/$platform_prefix$name_space_prefix$image_name_tag"
-            # A failed image should not prevent subsequent images from running.
-            if ! docker pull $line; then
-                echo "| \`$line\` | \`$new_image\` | ❌ Pull failed |" >> "$GITHUB_STEP_SUMMARY"
-                ((failed+=1))
-                continue
-            fi
-
-            if ! docker tag "$image" "$new_image"; then
-                echo "| \`$line\` | \`$new_image\` | ❌ Tag failed |" >> "$GITHUB_STEP_SUMMARY"
-                ((failed+=1))
-                docker rmi "$image" || true
-                continue
-            fi
-
-            if docker push "$new_image"; then
-                echo "| \`$line\` | \`$new_image\` | ✅ Pushed |" >> "$GITHUB_STEP_SUMMARY"
-                ((success+=1))
-            else
-                echo "| \`$line\` | \`$new_image\` | ❌ Push failed |" >> "$GITHUB_STEP_SUMMARY"
-                ((failed+=1))
-            fi
-
-            # Cleanup failures must not change the recorded push result.
-            docker rmi "$image" "$new_image" || true
-            df -hT
-
-        done < images.txt
-
-        {
-            echo ""
-            echo "### Totals"
-            echo "- ✅ Successful: $success"
-            echo "- ❌ Failed: $failed"
-            echo "- 📦 Total: $((success + failed))"
-        } >> "$GITHUB_STEP_SUMMARY"
-
-        # Keep the job red if any image failed, after processing all images.
-        if (( failed > 0 )); then
-            exit 1
-        fi
+          if failed:
+              raise SystemExit(1)
+          PY
