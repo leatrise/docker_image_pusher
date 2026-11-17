@@ -8,3 +8,7 @@ makeplane/plane-space:v1.5.0
 rabbitmq:3.13.6-management-alpine
 makeplane/plane-admin:v1.5.0
 makeplane/plane-frontend:v1.5.0
+node:22-alpine
+python:3.12.12-alpine
+ghcr.io/astral-sh/uv:0.12.21
+docker/dockerfile:1.7
